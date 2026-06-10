@@ -1,4 +1,22 @@
 #!/usr/bin/env python3
+"""
+PX4 Offboard Position Control - defensive / real-flight oriented example.
+
+Mission: arm -> takeoff -> move forward -> hover -> land.
+
+Safety layers added on top of the basic example:
+  - subscribes to vehicle_status_v1 (PX4 v1.16) and actually USES it
+  - waits for a valid local position estimate + pre-flight checks before arming
+  - confirms ARMED and OFFBOARD engaged (aborts if not within a timeout)
+  - detects pilot take-over / failsafe (nav_state leaves OFFBOARD) and STOPS
+    commanding, so it never fights the safety pilot and never auto-resumes
+  - per-state timeouts -> abort (hands control back to PX4 failsafe)
+  - tunable altitude / distance / hover / tolerance via ROS parameters
+
+IMPORTANT: this is only a *secondary* software safety layer. A safety pilot with
+RC override, PX4 failsafes (RC/datalink/battery/geofence), a geofence and a kill
+switch remain MANDATORY for any real flight.
+"""
 
 import rclpy
 from rclpy.node import Node
@@ -11,220 +29,267 @@ from px4_msgs.msg import VehicleLocalPosition
 from px4_msgs.msg import VehicleStatus
 
 
-class OffboardControl(Node):
-    """PX4 Offboard Position Control - 1m Forward Movement"""
+# states where we are actively flying in offboard and must hold OFFBOARD mode
+ACTIVE_OFFBOARD = ('TAKEOFF', 'FORWARD', 'HOVER')
+# states where we keep streaming the offboard heartbeat
+HEARTBEAT_STATES = ('INIT', 'ARMING', 'TAKEOFF', 'FORWARD', 'HOVER')
 
+
+class OffboardControl(Node):
     def __init__(self):
         super().__init__('offboard_control')
 
-        # QoS 설정 (PX4와 통신용)
-        qos_profile = QoSProfile(
+        # ---- tunable parameters (override at runtime / via launch) ----
+        self.declare_parameter('takeoff_altitude', 2.0)   # m, positive = up
+        self.declare_parameter('forward_distance', 1.0)   # m, +North
+        self.declare_parameter('hover_seconds', 5.0)
+        self.declare_parameter('reach_tolerance', 0.3)    # m
+        self.declare_parameter('state_timeout', 20.0)     # s per move state
+        self.declare_parameter('arm_timeout', 5.0)        # s to confirm ARMED+OFFBOARD
+
+        self.takeoff_alt = float(self.get_parameter('takeoff_altitude').value)
+        self.forward_dist = float(self.get_parameter('forward_distance').value)
+        self.hover_s = float(self.get_parameter('hover_seconds').value)
+        self.tol = float(self.get_parameter('reach_tolerance').value)
+        self.state_timeout = float(self.get_parameter('state_timeout').value)
+        self.arm_timeout = float(self.get_parameter('arm_timeout').value)
+
+        qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
-            depth=1
-        )
+            depth=1)
 
-        # Publishers
-        self.offboard_control_mode_pub = self.create_publisher(
-            OffboardControlMode, '/fmu/in/offboard_control_mode', qos_profile)
-        self.trajectory_setpoint_pub = self.create_publisher(
-            TrajectorySetpoint, '/fmu/in/trajectory_setpoint', qos_profile)
-        self.vehicle_command_pub = self.create_publisher(
-            VehicleCommand, '/fmu/in/vehicle_command', qos_profile)
+        # publishers
+        self.ocm_pub = self.create_publisher(
+            OffboardControlMode, '/fmu/in/offboard_control_mode', qos)
+        self.sp_pub = self.create_publisher(
+            TrajectorySetpoint, '/fmu/in/trajectory_setpoint', qos)
+        self.cmd_pub = self.create_publisher(
+            VehicleCommand, '/fmu/in/vehicle_command', qos)
 
-        # Subscribers
-        self.vehicle_local_position_sub = self.create_subscription(
-            VehicleLocalPosition, '/fmu/out/vehicle_local_position',
-            self.vehicle_local_position_callback, qos_profile)
-        self.vehicle_status_sub = self.create_subscription(
-            VehicleStatus, '/fmu/out/vehicle_status',
-            self.vehicle_status_callback, qos_profile)
+        # subscribers
+        self.create_subscription(
+            VehicleLocalPosition, '/fmu/out/vehicle_local_position', self._on_pos, qos)
+        self.create_subscription(
+            VehicleStatus, '/fmu/out/vehicle_status_v1', self._on_status, qos)
 
-        # 상태 변수
-        self.vehicle_local_position = VehicleLocalPosition()
-        self.vehicle_status = VehicleStatus()
-        self.offboard_setpoint_counter = 0
+        self.pos = VehicleLocalPosition()
+        self.status = VehicleStatus()
+        self.have_pos = False
+        self.have_status = False
 
-        # 목표 위치 (초기화 후 설정)
-        self.start_position_set = False
-        self.start_x = 0.0
-        self.start_y = 0.0
-        self.start_z = 0.0
-        self.target_x = 0.0
-        self.target_y = 0.0
-        self.target_z = -2.0  # 기본 고도 2m (NED 좌표계에서 -Z가 위)
+        self.state = 'INIT'
+        self.counter = 0
+        self.entered_offboard = False
+        self.start_set = False
+        self.start_x = self.start_y = self.start_z = 0.0
+        self.target_x = self.target_y = self.target_z = 0.0
+        self.state_start = self._now()
 
-        # 상태 머신
-        self.state = 'INIT'  # INIT -> TAKEOFF -> FORWARD -> HOVER -> LAND
+        self.timer = self.create_timer(0.1, self.loop)  # 10 Hz
 
-        # 타이머 (10Hz)
-        self.timer = self.create_timer(0.1, self.timer_callback)
+        self.get_logger().info('Defensive offboard node started')
+        self.get_logger().info(
+            f'params: alt={self.takeoff_alt}m dist={self.forward_dist}m '
+            f'hover={self.hover_s}s tol={self.tol}m')
 
-        self.get_logger().info('Offboard Control Node Started')
-        self.get_logger().info('Mission: Takeoff -> Move 1m Forward -> Hover')
+    # ---------- callbacks / helpers ----------
+    def _now(self):
+        return self.get_clock().now().nanoseconds / 1e9
 
-    def vehicle_local_position_callback(self, msg):
-        """현재 로컬 위치 업데이트"""
-        self.vehicle_local_position = msg
+    def _ts(self):
+        return int(self.get_clock().now().nanoseconds / 1000)
 
-    def vehicle_status_callback(self, msg):
-        """차량 상태 업데이트"""
-        self.vehicle_status = msg
+    def _on_pos(self, msg):
+        self.pos = msg
+        self.have_pos = True
+
+    def _on_status(self, msg):
+        self.status = msg
+        self.have_status = True
+
+    def pos_valid(self):
+        return self.have_pos and self.pos.xy_valid and self.pos.z_valid
+
+    def is_armed(self):
+        return self.status.arming_state == VehicleStatus.ARMING_STATE_ARMED
+
+    def in_offboard(self):
+        return self.status.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD
+
+    def set_state(self, s):
+        self.state = s
+        self.state_start = self._now()
+        self.get_logger().info(f'State -> {s}')
+
+    def elapsed(self):
+        return self._now() - self.state_start
+
+    def reached(self, x, y, z):
+        if not self.have_pos:
+            return False
+        return (abs(self.pos.x - x) < self.tol
+                and abs(self.pos.y - y) < self.tol
+                and abs(self.pos.z - z) < self.tol)
+
+    def abort(self, reason):
+        # Stop commanding. With the heartbeat gone, PX4's offboard-loss failsafe
+        # takes over; if a pilot took over, we simply stop fighting.
+        self.get_logger().error(f'ABORT: {reason}')
+        self.set_state('ABORT')
+
+    # ---------- command senders ----------
+    def heartbeat(self):
+        m = OffboardControlMode()
+        m.position = True
+        m.timestamp = self._ts()
+        self.ocm_pub.publish(m)
+
+    def setpoint(self, x, y, z, yaw=0.0):
+        m = TrajectorySetpoint()
+        m.position = [float(x), float(y), float(z)]
+        m.yaw = float(yaw)
+        m.timestamp = self._ts()
+        self.sp_pub.publish(m)
+
+    def send_cmd(self, command, **p):
+        m = VehicleCommand()
+        m.command = command
+        for i in range(1, 8):
+            setattr(m, f'param{i}', float(p.get(f'param{i}', 0.0)))
+        m.target_system = 1
+        m.target_component = 1
+        m.source_system = 1
+        m.source_component = 1
+        m.from_external = True
+        m.timestamp = self._ts()
+        self.cmd_pub.publish(m)
 
     def arm(self):
-        """드론 Arm"""
-        self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=1.0)
-        self.get_logger().info('Arm command sent')
+        self.send_cmd(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=1.0)
 
-    def disarm(self):
-        """드론 Disarm"""
-        self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=0.0)
-        self.get_logger().info('Disarm command sent')
-
-    def engage_offboard_mode(self):
-        """오프보드 모드 진입"""
-        self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0, param2=6.0)
-        self.get_logger().info('Offboard mode command sent')
+    def engage_offboard(self):
+        self.send_cmd(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0, param2=6.0)
 
     def land(self):
-        """착륙 명령"""
-        self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
-        self.get_logger().info('Land command sent')
+        self.send_cmd(VehicleCommand.VEHICLE_CMD_NAV_LAND)
 
-    def publish_offboard_control_mode(self):
-        """오프보드 제어 모드 퍼블리시 (Position 모드)"""
-        msg = OffboardControlMode()
-        msg.position = True
-        msg.velocity = False
-        msg.acceleration = False
-        msg.attitude = False
-        msg.body_rate = False
-        msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
-        self.offboard_control_mode_pub.publish(msg)
+    # ---------- main loop ----------
+    def loop(self):
+        # stream the offboard heartbeat only while we intend to be in offboard
+        if self.state in HEARTBEAT_STATES:
+            self.heartbeat()
 
-    def publish_trajectory_setpoint(self, x, y, z, yaw=0.0):
-        """위치 목표점 퍼블리시 (NED 좌표계)"""
-        msg = TrajectorySetpoint()
-        msg.position = [x, y, z]
-        msg.yaw = yaw
-        msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
-        self.trajectory_setpoint_pub.publish(msg)
+        # all safety decisions need vehicle status
+        if not self.have_status:
+            return
 
-    def publish_vehicle_command(self, command, **params):
-        """Vehicle Command 퍼블리시"""
-        msg = VehicleCommand()
-        msg.command = command
-        msg.param1 = params.get('param1', 0.0)
-        msg.param2 = params.get('param2', 0.0)
-        msg.param3 = params.get('param3', 0.0)
-        msg.param4 = params.get('param4', 0.0)
-        msg.param5 = params.get('param5', 0.0)
-        msg.param6 = params.get('param6', 0.0)
-        msg.param7 = params.get('param7', 0.0)
-        msg.target_system = 1
-        msg.target_component = 1
-        msg.source_system = 1
-        msg.source_component = 1
-        msg.from_external = True
-        msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
-        self.vehicle_command_pub.publish(msg)
+        # pilot take-over / failsafe detection while actively flying offboard
+        if self.entered_offboard and self.state in ACTIVE_OFFBOARD:
+            if not self.in_offboard():
+                self.abort('left OFFBOARD (pilot take-over or failsafe)')
+                return
+            if self.status.failsafe:
+                self.abort('PX4 failsafe active')
+                return
 
-    def is_at_position(self, target_x, target_y, target_z, tolerance=0.2):
-        """목표 위치 도달 여부 확인"""
-        dx = abs(self.vehicle_local_position.x - target_x)
-        dy = abs(self.vehicle_local_position.y - target_y)
-        dz = abs(self.vehicle_local_position.z - target_z)
-        return dx < tolerance and dy < tolerance and dz < tolerance
-
-    def timer_callback(self):
-        """메인 제어 루프 (10Hz)"""
-
-        # 오프보드 제어 모드 지속적으로 퍼블리시 (필수)
-        self.publish_offboard_control_mode()
-
-        # 초기 시작 위치 저장
-        if not self.start_position_set and self.vehicle_local_position.timestamp > 0:
-            self.start_x = self.vehicle_local_position.x
-            self.start_y = self.vehicle_local_position.y
-            self.start_z = self.vehicle_local_position.z
-            self.start_position_set = True
-            self.get_logger().info(f'Start position: x={self.start_x:.2f}, y={self.start_y:.2f}, z={self.start_z:.2f}')
-
-        # 상태 머신
         if self.state == 'INIT':
-            # 오프보드 모드 진입 전 최소 setpoint 전송 (PX4 요구사항)
-            self.publish_trajectory_setpoint(
-                self.start_x, self.start_y, -2.0)  # 이륙 고도 2m
-
-            if self.offboard_setpoint_counter >= 10:
-                self.engage_offboard_mode()
-                self.arm()
-                self.state = 'TAKEOFF'
-                self.get_logger().info('State: TAKEOFF - Ascending to 2m altitude')
-
-            self.offboard_setpoint_counter += 1
-
+            self._init()
+        elif self.state == 'ARMING':
+            self._arming()
         elif self.state == 'TAKEOFF':
-            # 이륙: 현재 x, y 유지하면서 고도 2m로 상승
-            takeoff_x = self.start_x
-            takeoff_y = self.start_y
-            takeoff_z = -2.0  # 2m 고도 (NED)
-
-            self.publish_trajectory_setpoint(takeoff_x, takeoff_y, takeoff_z)
-
-            if self.is_at_position(takeoff_x, takeoff_y, takeoff_z):
-                self.state = 'FORWARD'
-                # 목표 위치: X축(North 방향)으로 1m 전진
-                self.target_x = takeoff_x + 1.0
-                self.target_y = takeoff_y
-                self.target_z = takeoff_z
-                self.get_logger().info(f'State: FORWARD - Moving 1m forward to x={self.target_x:.2f}')
-
+            self._takeoff()
         elif self.state == 'FORWARD':
-            # 1m 전진
-            self.publish_trajectory_setpoint(self.target_x, self.target_y, self.target_z)
-
-            if self.is_at_position(self.target_x, self.target_y, self.target_z):
-                self.state = 'HOVER'
-                self.hover_counter = 0
-                self.get_logger().info('State: HOVER - Reached target position!')
-                self.get_logger().info(f'Current position: x={self.vehicle_local_position.x:.2f}, '
-                                      f'y={self.vehicle_local_position.y:.2f}, '
-                                      f'z={self.vehicle_local_position.z:.2f}')
-
+            self._forward()
         elif self.state == 'HOVER':
-            # 목표 위치에서 호버링 (5초 후 착륙)
-            self.publish_trajectory_setpoint(self.target_x, self.target_y, self.target_z)
-            self.hover_counter += 1
+            self._hover()
+        elif self.state == 'LANDING':
+            self._landing()
+        # ABORT / DONE: do nothing (no setpoints, no heartbeat)
 
-            if self.hover_counter >= 50:  # 5초 (10Hz * 50)
-                self.state = 'LAND'
-                self.land()
-                self.get_logger().info('State: LAND - Mission complete, landing...')
+    def _init(self):
+        # capture start position once we have a valid estimate
+        if self.pos_valid() and not self.start_set:
+            self.start_x, self.start_y, self.start_z = self.pos.x, self.pos.y, self.pos.z
+            self.start_set = True
+            self.get_logger().info(
+                f'start: x={self.start_x:.2f} y={self.start_y:.2f} z={self.start_z:.2f}')
 
-        elif self.state == 'LAND':
-            # 착륙 중 - 오프보드 모드 유지하며 현재 위치 전송
-            self.publish_trajectory_setpoint(
-                self.vehicle_local_position.x,
-                self.vehicle_local_position.y,
-                self.vehicle_local_position.z)
+        # do NOT arm without a valid position estimate
+        if not self.start_set:
+            return
+
+        # stream the takeoff setpoint before switching to offboard (PX4 requirement).
+        # Altitude is RELATIVE to the captured start/ground (start_z - alt), so it is
+        # robust to a non-zero local-position z reference.
+        self.setpoint(self.start_x, self.start_y, self.start_z - self.takeoff_alt)
+        self.counter += 1
+
+        # arm only when position is valid AND PX4 pre-arm checks pass
+        if (self.counter >= 20 and self.pos_valid()
+                and self.status.pre_flight_checks_pass and not self.status.failsafe):
+            self.engage_offboard()
+            self.arm()
+            self.set_state('ARMING')
+        elif self.counter == 60:
+            self.get_logger().warn(
+                'waiting to arm: '
+                f'pos_valid={self.pos_valid()} '
+                f'pre_flight_checks_pass={self.status.pre_flight_checks_pass}')
+
+    def _arming(self):
+        # keep streaming setpoint; confirm both ARMED and OFFBOARD
+        self.setpoint(self.start_x, self.start_y, self.start_z - self.takeoff_alt)
+        if self.is_armed() and self.in_offboard():
+            self.entered_offboard = True
+            self.target_x, self.target_y = self.start_x, self.start_y
+            self.target_z = self.start_z - self.takeoff_alt
+            self.set_state('TAKEOFF')
+            self.get_logger().info(f'climbing to z={self.target_z:.2f} (start_z {self.start_z:.2f} - {self.takeoff_alt}m)')
+        elif self.elapsed() > self.arm_timeout:
+            self.abort('failed to ARM / enter OFFBOARD in time')
+
+    def _takeoff(self):
+        self.setpoint(self.target_x, self.target_y, self.target_z)
+        if self.reached(self.target_x, self.target_y, self.target_z):
+            self.target_x = self.start_x + self.forward_dist
+            self.set_state('FORWARD')
+        elif self.elapsed() > self.state_timeout:
+            self.abort('takeoff timeout')
+
+    def _forward(self):
+        self.setpoint(self.target_x, self.target_y, self.target_z)
+        if self.reached(self.target_x, self.target_y, self.target_z):
+            self.set_state('HOVER')
+        elif self.elapsed() > self.state_timeout:
+            self.abort('forward timeout')
+
+    def _hover(self):
+        self.setpoint(self.target_x, self.target_y, self.target_z)
+        if self.elapsed() >= self.hover_s:
+            self.land()
+            self.set_state('LANDING')
+
+    def _landing(self):
+        # PX4 AUTO_LAND now owns the descent; we stop sending setpoints/heartbeat.
+        if not self.is_armed():
+            self.get_logger().info('landed and disarmed - mission complete')
+            self.set_state('DONE')
+        elif self.elapsed() > self.state_timeout * 2:
+            self.get_logger().warn('still armed after landing timeout - leaving to PX4 / pilot')
+            self.set_state('DONE')
 
 
 def main(args=None):
-    print('Starting PX4 Offboard Position Control Node...')
-    print('Mission: Takeoff (2m) -> Move 1m Forward -> Hover (5s) -> Land')
-    print('')
-
     rclpy.init(args=args)
-    offboard_control = OffboardControl()
-
+    node = OffboardControl()
     try:
-        rclpy.spin(offboard_control)
+        rclpy.spin(node)
     except KeyboardInterrupt:
-        print('\nKeyboard interrupt, shutting down...')
+        pass
     finally:
-        offboard_control.destroy_node()
+        node.destroy_node()
         rclpy.shutdown()
 
 
