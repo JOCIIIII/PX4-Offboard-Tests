@@ -21,9 +21,14 @@ public:
     : Node("velocity_controller"), tick_count_(0), last_command_("idle"), test_phase_("WAIT")
     {
         this->declare_parameter<int>("system_id", 1);
+        // Topic prefix: bare "/fmu/" for single-vehicle SITL (default), or
+        // "vehicleN/fmu/" for multi-vehicle setups (set use_vehicle_namespace:=true).
+        this->declare_parameter<bool>("use_vehicle_namespace", false);
         system_id_ = this->get_parameter("system_id").as_int();
 
-        std::string prefix = "vehicle" + std::to_string(system_id_) + "/fmu/";
+        std::string prefix = this->get_parameter("use_vehicle_namespace").as_bool()
+                               ? ("vehicle" + std::to_string(system_id_) + "/fmu/")
+                               : "/fmu/";
 
         RCLCPP_INFO(this->get_logger(), "Configure velocity_controller (system_id: %d)", system_id_);
 
